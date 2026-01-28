@@ -20,6 +20,7 @@ sys.path.append("..")
 
 from claude_agent_sdk import query, ClaudeAgentOptions
 from utils.config import check_api_key, PROJECT_ROOT
+from utils.message_tracker import MessageTracker
 
 
 # Create a sandbox directory for code execution
@@ -50,9 +51,15 @@ async def execute_code_simple():
     Save the script as prime_calculator.py and run it.
     """
 
+    tracker = MessageTracker(name="code_exec_simple")
+
     async for message in query(prompt=prompt, options=options):
+        tracker.track(message)
         if hasattr(message, "result"):
             print(f"\nResult:\n{message.result}")
+
+    tracker.print_summary()
+    tracker.save()
 
 
 async def execute_code_data_analysis():
@@ -79,9 +86,15 @@ async def execute_code_data_analysis():
     Save as sales_analysis.py and run it.
     """
 
+    tracker = MessageTracker(name="code_exec_data_analysis")
+
     async for message in query(prompt=prompt, options=options):
+        tracker.track(message)
         if hasattr(message, "result"):
             print(f"\nResult:\n{message.result}")
+
+    tracker.print_summary()
+    tracker.save()
 
 
 async def execute_code_with_output_file():
@@ -109,9 +122,15 @@ async def execute_code_with_output_file():
     Then show me the contents of employees.json.
     """
 
+    tracker = MessageTracker(name="code_exec_output_file")
+
     async for message in query(prompt=prompt, options=options):
+        tracker.track(message)
         if hasattr(message, "result"):
             print(f"\nResult:\n{message.result}")
+
+    tracker.print_summary()
+    tracker.save()
 
 
 async def execute_code_math_computation():
@@ -138,9 +157,15 @@ async def execute_code_math_computation():
     Save as math_demo.py and run it.
     """
 
+    tracker = MessageTracker(name="code_exec_math")
+
     async for message in query(prompt=prompt, options=options):
+        tracker.track(message)
         if hasattr(message, "result"):
             print(f"\nResult:\n{message.result}")
+
+    tracker.print_summary()
+    tracker.save()
 
 
 async def execute_code_interactive():
@@ -184,9 +209,15 @@ print(f"Sorted: {sorted_data}")
     Save it as user_script.py and run it.
     """
 
+    tracker = MessageTracker(name="code_exec_interactive")
+
     async for message in query(prompt=prompt, options=options):
+        tracker.track(message)
         if hasattr(message, "result"):
             print(f"\nResult:\n{message.result}")
+
+    tracker.print_summary()
+    tracker.save()
 
 
 async def main():
@@ -201,10 +232,10 @@ async def main():
     # Run demos sequentially
     demos = [
         ("Simple Code Execution", execute_code_simple),
-        ("Data Analysis", execute_code_data_analysis),
-        ("Output Files", execute_code_with_output_file),
-        ("Math Computation", execute_code_math_computation),
-        ("Interactive Execution", execute_code_interactive),
+        # ("Data Analysis", execute_code_data_analysis),
+        # ("Output Files", execute_code_with_output_file),
+        # ("Math Computation", execute_code_math_computation),
+        # ("Interactive Execution", execute_code_interactive),
     ]
 
     print("\nAvailable Demos:")
