@@ -1,0 +1,440 @@
+"""
+Example 18: User Isolation Demo (Full Sandboxing)
+=================================================
+演示如何使用 Claude Agent SDK 实现多用户隔离。
+
+隔离机制：
+1. cwd 目录隔离 - 每个用户有独立的工作目录
+2. can_use_tool 权限控制 - 验证文件路径、过滤危险命令
+3. Hooks 审计日志 - 记录所有操作
+
+演示场景：
+1. Alice 创建文件 → 成功
+2. Bob 尝试读取 Alice 的文件 → 被拒绝
+3. Bob 创建自己的文件 → 成功
+4. Alice 尝试执行危险命令 → 被拒绝
+"""
+
+import asyncio
+import sys
+import os
+from pathlib import Path
+from datetime import datetime
+from typing import Any
+
+sys.path.append("..")
+
+from claude_agent_sdk import (
+    ClaudeSDKClient,
+    ClaudeAgentOptions,
+    HookMatcher,
+    AssistantMessage,
+    TextBlock,
+    ToolUseBlock,
+    ResultMessage,
+)
+from utils.config import check_api_key, PROJECT_ROOT
+
+# 权限结果类型（简化版，避免导入问题）
+def PermissionAllow(updated_input: dict) -> dict:
+    return {"behavior": "allow", "updatedInput": updated_input}
+
+def PermissionDeny(message: str, interrupt: bool = False) -> dict:
+    return {"behavior": "deny", "message": message, "interrupt": interrupt}
+
+
+# ============================================================
+# 配置
+# ============================================================
+SANDBOX_ROOT = Path(PROJECT_ROOT) / "sandboxes"
+SANDBOX_ROOT.mkdir(exist_ok=True)
+
+
+# ============================================================
+# 审计日志
+# ============================================================
+class AuditLogger:
+    """简单的审计日志记录器"""
+
+    def __init__(self):
+        self.logs: list[dict] = []
+
+    def log(self, user_id: str, action: str, details: dict, allowed: bool = True):
+        entry = {
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "user": user_id,
+            "action": action,
+            "allowed": "✓" if allowed else "✗",
+            "details": details,
+        }
+        self.logs.append(entry)
+        status = "✓ ALLOWED" if allowed else "✗ DENIED"
+        print(f"  [{entry['timestamp']}] [{user_id}] {action} {status}")
+        if details:
+            for k, v in details.items():
+                print(f"    {k}: {v}")
+
+    def print_summary(self):
+        print("\n" + "=" * 60)
+        print("审计日志摘要")
+        print("=" * 60)
+        for entry in self.logs:
+            print(f"[{entry['timestamp']}] {entry['user']:10} | {entry['allowed']} {entry['action']}")
+
+
+# 全局审计日志
+audit_logger = AuditLogger()
+
+
+# ============================================================
+# 用户隔离会话
+# ============================================================
+class IsolatedUserSession:
+    """
+    隔离的用户会话。
+
+    每个用户有：
+    - 独立的工作目录 (workspace)
+    - 独立的权限检查 (can_use_tool)
+    - 独立的审计钩子 (hooks)
+    """
+
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        self.workspace = SANDBOX_ROOT / user_id
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.client: ClaudeSDKClient | None = None
+
+        print(f"\n[创建用户会话] {user_id}")
+        print(f"  工作目录: {self.workspace}")
+
+    async def _permission_handler(
+        self,
+        tool_name: str,
+        input_data: dict[str, Any],
+        context: Any
+    ) -> dict:
+        """
+        权限处理器 - 核心隔离逻辑
+
+        检查：
+        1. 文件操作是否在用户工作区内
+        2. Bash 命令是否安全
+        """
+
+        # ========== 文件操作检查 ==========
+        if tool_name in ["Read", "Write", "Edit"]:
+            file_path = input_data.get("file_path", "")
+
+            # 解析路径
+            try:
+                # 处理相对路径
+                if not os.path.isabs(file_path):
+                    resolved = (self.workspace / file_path).resolve()
+                else:
+                    resolved = Path(file_path).resolve()
+
+                workspace_resolved = self.workspace.resolve()
+
+                # 检查是否在工作区内
+                if not str(resolved).startswith(str(workspace_resolved)):
+                    audit_logger.log(
+                        self.user_id,
+                        f"{tool_name} (路径越界)",
+                        {"path": file_path, "resolved": str(resolved)},
+                        allowed=False
+                    )
+                    return PermissionDeny(
+                        message=f"访问被拒绝: 路径 '{file_path}' 在您的工作区外",
+                        interrupt=False
+                    )
+
+                audit_logger.log(
+                    self.user_id,
+                    tool_name,
+                    {"path": str(resolved)},
+                    allowed=True
+                )
+
+            except Exception as e:
+                audit_logger.log(
+                    self.user_id,
+                    f"{tool_name} (路径错误)",
+                    {"path": file_path, "error": str(e)},
+                    allowed=False
+                )
+                return PermissionDeny(
+                    message=f"路径解析错误: {e}",
+                    interrupt=False
+                )
+
+        # ========== Bash 命令检查 ==========
+        elif tool_name == "Bash":
+            command = input_data.get("command", "")
+
+            # 危险命令模式
+            dangerous_patterns = [
+                "rm -rf /",
+                "rm -rf ~",
+                "sudo",
+                "chmod 777",
+                "> /dev/",
+                "dd if=",
+                "mkfs",
+                ":(){:|:&};:",  # fork bomb
+                "curl | bash",
+                "wget | bash",
+            ]
+
+            for pattern in dangerous_patterns:
+                if pattern in command:
+                    audit_logger.log(
+                        self.user_id,
+                        "Bash (危险命令)",
+                        {"command": command, "pattern": pattern},
+                        allowed=False
+                    )
+                    return PermissionDeny(
+                        message=f"危险命令被阻止: 包含 '{pattern}'",
+                        interrupt=False
+                    )
+
+            # 检查命令是否尝试访问其他用户目录
+            other_users = [d.name for d in SANDBOX_ROOT.iterdir() if d.is_dir() and d.name != self.user_id]
+            for other_user in other_users:
+                other_path = str(SANDBOX_ROOT / other_user)
+                if other_path in command:
+                    audit_logger.log(
+                        self.user_id,
+                        "Bash (访问其他用户)",
+                        {"command": command, "target_user": other_user},
+                        allowed=False
+                    )
+                    return PermissionDeny(
+                        message=f"禁止访问其他用户的目录: {other_user}",
+                        interrupt=False
+                    )
+
+            audit_logger.log(
+                self.user_id,
+                "Bash",
+                {"command": command[:50] + "..." if len(command) > 50 else command},
+                allowed=True
+            )
+
+        # ========== 其他工具 ==========
+        else:
+            audit_logger.log(
+                self.user_id,
+                tool_name,
+                {},
+                allowed=True
+            )
+
+        return PermissionAllow(updated_input=input_data)
+
+    async def _pre_tool_hook(
+        self,
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: Any
+    ) -> dict[str, Any]:
+        """工具执行前钩子 - 用于额外的审计"""
+        # 这里可以添加更多的预检查逻辑
+        return {}
+
+    async def _post_tool_hook(
+        self,
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: Any
+    ) -> dict[str, Any]:
+        """工具执行后钩子 - 记录结果"""
+        tool_name = input_data.get("tool_name", "unknown")
+        # 可以在这里记录工具执行结果
+        return {}
+
+    def get_options(self) -> ClaudeAgentOptions:
+        """获取用户专属的配置选项"""
+        return ClaudeAgentOptions(
+            user=self.user_id,
+            cwd=str(self.workspace),
+            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+            permission_mode="default",  # 使用默认权限模式，配合 can_use_tool
+            can_use_tool=self._permission_handler,
+            hooks={
+                "PreToolUse": [HookMatcher(hooks=[self._pre_tool_hook])],
+                "PostToolUse": [HookMatcher(hooks=[self._post_tool_hook])],
+            },
+        )
+
+    async def execute(self, prompt: str) -> str:
+        """执行用户请求"""
+        options = self.get_options()
+        result_text = ""
+
+        print(f"\n[{self.user_id}] 执行请求: {prompt[:50]}...")
+        print("-" * 40)
+
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                self.client = client
+                await client.query(prompt)
+
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                result_text += block.text
+                            elif isinstance(block, ToolUseBlock):
+                                print(f"  [工具调用] {block.name}")
+
+                    elif isinstance(message, ResultMessage):
+                        if message.result:
+                            result_text = message.result
+
+        except Exception as e:
+            result_text = f"执行错误: {e}"
+            print(f"  [错误] {e}")
+
+        return result_text
+
+
+# ============================================================
+# 演示场景
+# ============================================================
+async def demo_scenario_1_alice_creates_file(alice: IsolatedUserSession):
+    """场景 1: Alice 创建文件"""
+    print("\n" + "=" * 60)
+    print("场景 1: Alice 在自己的目录创建文件")
+    print("=" * 60)
+
+    result = await alice.execute(
+        "请在当前目录创建一个名为 secret.txt 的文件，内容为 'Alice 的秘密数据: ABC123'"
+    )
+
+    print(f"\n结果: {result[:200] if result else '(无输出)'}")
+
+    # 验证文件是否创建
+    secret_file = alice.workspace / "secret.txt"
+    if secret_file.exists():
+        print(f"\n验证: 文件已创建于 {secret_file}")
+        print(f"  内容: {secret_file.read_text()}")
+    else:
+        print("\n验证: 文件未创建")
+
+
+async def demo_scenario_2_bob_reads_alice_file(bob: IsolatedUserSession, alice: IsolatedUserSession):
+    """场景 2: Bob 尝试读取 Alice 的文件"""
+    print("\n" + "=" * 60)
+    print("场景 2: Bob 尝试读取 Alice 的文件 (应被拒绝)")
+    print("=" * 60)
+
+    # Bob 尝试直接读取 Alice 的文件
+    alice_secret = alice.workspace / "secret.txt"
+
+    result = await bob.execute(
+        f"请读取文件: {alice_secret}"
+    )
+
+    print(f"\n结果: {result[:200] if result else '(无输出)'}")
+
+
+async def demo_scenario_3_bob_creates_own_file(bob: IsolatedUserSession):
+    """场景 3: Bob 创建自己的文件"""
+    print("\n" + "=" * 60)
+    print("场景 3: Bob 在自己的目录创建文件")
+    print("=" * 60)
+
+    result = await bob.execute(
+        "请创建一个名为 my_data.txt 的文件，内容为 'Bob 的数据: XYZ789'"
+    )
+
+    print(f"\n结果: {result[:200] if result else '(无输出)'}")
+
+    # 验证
+    bob_file = bob.workspace / "my_data.txt"
+    if bob_file.exists():
+        print(f"\n验证: 文件已创建于 {bob_file}")
+
+
+async def demo_scenario_4_alice_dangerous_command(alice: IsolatedUserSession):
+    """场景 4: Alice 尝试执行危险命令"""
+    print("\n" + "=" * 60)
+    print("场景 4: Alice 尝试执行危险命令 (应被拒绝)")
+    print("=" * 60)
+
+    result = await alice.execute(
+        "请执行命令: rm -rf /"
+    )
+
+    print(f"\n结果: {result[:200] if result else '(无输出)'}")
+
+
+async def demo_scenario_5_bob_access_alice_via_bash(bob: IsolatedUserSession, alice: IsolatedUserSession):
+    """场景 5: Bob 尝试通过 Bash 访问 Alice 的目录"""
+    print("\n" + "=" * 60)
+    print("场景 5: Bob 尝试通过 Bash 命令访问 Alice 的目录 (应被拒绝)")
+    print("=" * 60)
+
+    result = await bob.execute(
+        f"请执行命令: cat {alice.workspace}/secret.txt"
+    )
+
+    print(f"\n结果: {result[:200] if result else '(无输出)'}")
+
+
+async def demo_isolation_summary(alice: IsolatedUserSession, bob: IsolatedUserSession):
+    """展示隔离状态摘要"""
+    print("\n" + "=" * 60)
+    print("用户隔离状态摘要")
+    print("=" * 60)
+
+    print(f"\nAlice 的工作区: {alice.workspace}")
+    alice_files = list(alice.workspace.glob("*"))
+    print(f"  文件: {[f.name for f in alice_files]}")
+
+    print(f"\nBob 的工作区: {bob.workspace}")
+    bob_files = list(bob.workspace.glob("*"))
+    print(f"  文件: {[f.name for f in bob_files]}")
+
+    print("\n隔离机制:")
+    print("  1. cwd 隔离: 每个用户有独立的工作目录")
+    print("  2. 路径验证: can_use_tool 检查文件路径是否在用户工作区内")
+    print("  3. 命令过滤: Bash 命令被检查危险模式和跨用户访问")
+    print("  4. 审计日志: 所有操作都被记录")
+
+
+async def main():
+    """运行用户隔离演示"""
+    check_api_key()
+
+    print("\n" + "#" * 60)
+    print("# Claude Agent SDK - 用户隔离演示 (Full Sandboxing)")
+    print(f"# 沙箱根目录: {SANDBOX_ROOT}")
+    print("#" * 60)
+
+    # 创建两个用户的隔离会话
+    alice = IsolatedUserSession("alice")
+    bob = IsolatedUserSession("bob")
+
+    # 运行演示场景
+    await demo_scenario_1_alice_creates_file(alice)
+    await demo_scenario_2_bob_reads_alice_file(bob, alice)
+    await demo_scenario_3_bob_creates_own_file(bob)
+    await demo_scenario_4_alice_dangerous_command(alice)
+    await demo_scenario_5_bob_access_alice_via_bash(bob, alice)
+
+    # 显示摘要
+    await demo_isolation_summary(alice, bob)
+
+    # 打印审计日志
+    audit_logger.print_summary()
+
+    print("\n" + "=" * 60)
+    print("演示完成!")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
