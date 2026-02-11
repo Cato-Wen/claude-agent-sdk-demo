@@ -13,6 +13,8 @@ Example 18: User Isolation Demo (Full Sandboxing)
 2. Bob 尝试读取 Alice 的文件 → 被拒绝
 3. Bob 创建自己的文件 → 成功
 4. Alice 尝试执行危险命令 → 被拒绝
+5. Alice 使用 code-reviewer Skill 审查代码 → 成功（Skill + 隔离）
+6. Bob 使用 doc-generator Skill 生成文档 → 成功（Skill + 隔离）
 """
 
 import asyncio
@@ -222,6 +224,16 @@ class IsolatedUserSession:
                 allowed=True
             )
 
+        # ========== Skill 调用检查 ==========
+        elif tool_name == "Skill":
+            skill_name = input_data.get("skill", "unknown")
+            audit_logger.log(
+                self.user_id,
+                f"Skill ({skill_name})",
+                {"skill": skill_name, "args": input_data.get("args", "")},
+                allowed=True
+            )
+
         # ========== 其他工具 ==========
         else:
             audit_logger.log(
@@ -257,15 +269,17 @@ class IsolatedUserSession:
     def get_options(self) -> ClaudeAgentOptions:
         """获取用户专属的配置选项"""
         return ClaudeAgentOptions(
-            user=self.user_id,
             cwd=str(self.workspace),
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-            permission_mode="default",  # 使用默认权限模式，配合 can_use_tool
+            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Skill"],
+            setting_sources=["project"],  # 加载 .claude/skills/ 下的 Skill 定义
+            permission_mode="delegate",  # 将所有工具权限决策委托给 can_use_tool 回调
             can_use_tool=self._permission_handler,
             hooks={
                 "PreToolUse": [HookMatcher(hooks=[self._pre_tool_hook])],
                 "PostToolUse": [HookMatcher(hooks=[self._post_tool_hook])],
             },
+            stderr=lambda line: print(f"  [STDERR/{self.user_id}] {line}"),
+            extra_args={"debug-to-stderr": None},
         )
 
     async def execute(self, prompt: str) -> str:
@@ -384,6 +398,63 @@ async def demo_scenario_5_bob_access_alice_via_bash(bob: IsolatedUserSession, al
     print(f"\n结果: {result[:200] if result else '(无输出)'}")
 
 
+async def demo_scenario_6_alice_uses_skill(alice: IsolatedUserSession):
+    """场景 6: Alice 使用 code-reviewer Skill 审查自己的代码"""
+    print("\n" + "=" * 60)
+    print("场景 6: Alice 使用 code-reviewer Skill 审查代码")
+    print("=" * 60)
+
+    # 先让 Alice 创建一个 Python 文件供审查
+    await alice.execute(
+        "请创建一个名为 app.py 的文件，内容如下:\n"
+        "import os\n"
+        "password = '123456'\n"
+        "def get_data(sql):\n"
+        "    query = 'SELECT * FROM users WHERE id=' + sql\n"
+        "    return query\n"
+    )
+
+    # 使用 code-reviewer Skill 审查
+    result = await alice.execute(
+        "Run /code-reviewer on the file app.py in the current directory"
+    )
+
+    print(f"\n审查结果: {result[:500] if result else '(无输出)'}")
+
+
+async def demo_scenario_7_bob_uses_skill(bob: IsolatedUserSession):
+    """场景 7: Bob 使用 doc-generator Skill 为自己的代码生成文档"""
+    print("\n" + "=" * 60)
+    print("场景 7: Bob 使用 doc-generator Skill 生成文档")
+    print("=" * 60)
+
+    # 先让 Bob 创建一个 Python 文件
+    await bob.execute(
+        "请创建一个名为 utils.py 的文件，内容如下:\n"
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "def multiply(a, b):\n"
+        "    return a * b\n\n"
+        "class Calculator:\n"
+        "    def __init__(self):\n"
+        "        self.history = []\n"
+        "    def calc(self, op, a, b):\n"
+        "        if op == 'add':\n"
+        "            result = add(a, b)\n"
+        "        else:\n"
+        "            result = multiply(a, b)\n"
+        "        self.history.append(result)\n"
+        "        return result\n"
+    )
+
+    # 使用 doc-generator Skill 生成文档
+    result = await bob.execute(
+        "Run /doc-generator on the file utils.py in the current directory"
+    )
+
+    print(f"\n文档结果: {result[:500] if result else '(无输出)'}")
+
+
 async def demo_isolation_summary(alice: IsolatedUserSession, bob: IsolatedUserSession):
     """展示隔离状态摘要"""
     print("\n" + "=" * 60)
@@ -403,6 +474,7 @@ async def demo_isolation_summary(alice: IsolatedUserSession, bob: IsolatedUserSe
     print("  2. 路径验证: can_use_tool 检查文件路径是否在用户工作区内")
     print("  3. 命令过滤: Bash 命令被检查危险模式和跨用户访问")
     print("  4. 审计日志: 所有操作都被记录")
+    print("  5. Skill 隔离: 每个用户可调用 Skill，但文件操作仍受工作区限制")
 
 
 async def main():
@@ -419,11 +491,15 @@ async def main():
     bob = IsolatedUserSession("bob")
 
     # 运行演示场景
-    await demo_scenario_1_alice_creates_file(alice)
+    # await demo_scenario_1_alice_creates_file(alice)
     await demo_scenario_2_bob_reads_alice_file(bob, alice)
-    await demo_scenario_3_bob_creates_own_file(bob)
-    await demo_scenario_4_alice_dangerous_command(alice)
-    await demo_scenario_5_bob_access_alice_via_bash(bob, alice)
+    # await demo_scenario_3_bob_creates_own_file(bob)
+    # await demo_scenario_4_alice_dangerous_command(alice)
+    # await demo_scenario_5_bob_access_alice_via_bash(bob, alice)
+
+    # Skill 演示场景
+    # await demo_scenario_6_alice_uses_skill(alice)
+    # await demo_scenario_7_bob_uses_skill(bob)
 
     # 显示摘要
     await demo_isolation_summary(alice, bob)
