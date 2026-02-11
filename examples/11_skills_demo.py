@@ -13,6 +13,9 @@ Skill files location:
 
 import asyncio
 import sys
+
+from utils.message_tracker import MessageTracker
+
 sys.path.append("..")
 
 from claude_agent_sdk import query, ClaudeAgentOptions
@@ -60,19 +63,19 @@ async def use_code_reviewer_skill():
     )
 
     prompt = """
-    Please review the Python code in the examples directory.
+    Please review the java code in the "C:\\CT-Project\\backend\\internal-recipe-service\\src\\main\\java\\app\\internalrecipe\\item\\web\\AlignBOMHeaderNameController.java".
     Focus on:
     1. Code quality issues
     2. Any potential bugs
     3. Suggestions for improvement
-
-    Use the code-reviewer skill for this task.
     """
 
     print(f"\nReviewing code in: {PROJECT_ROOT / 'examples'}")
     print("-" * 60)
+    tracker = MessageTracker(name="skills_demo_interactive")
 
     async for message in query(prompt=prompt, options=options):
+        tracker.track(message)
         if hasattr(message, "result"):
             print(f"\n{message.result}")
         elif hasattr(message, "content"):
@@ -80,6 +83,8 @@ async def use_code_reviewer_skill():
             if isinstance(content, str):
                 print(content, end="", flush=True)
 
+    tracker.print_summary()
+    tracker.save()
 
 async def invoke_skill_directly():
     """Invoke a skill directly by name."""
@@ -119,7 +124,7 @@ async def main():
     print("#" * 60)
 
     # Demo 1: List available skills
-    await list_available_skills()
+    # await list_available_skills()
 
     # Demo 2: Use the code-reviewer skill
     await use_code_reviewer_skill()

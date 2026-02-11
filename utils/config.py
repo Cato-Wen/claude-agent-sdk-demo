@@ -1,6 +1,7 @@
 """Shared configuration for Claude Agent SDK demos."""
 
 import os
+import platform
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -13,6 +14,23 @@ PROJECTS_DIR = PROJECT_ROOT / "projects"
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 
+def _convert_path_for_wsl(windows_path: str) -> str:
+    """Convert Windows path to WSL path if running in WSL."""
+    if not windows_path:
+        return windows_path
+
+    # Check if we're in WSL (Linux with access to /mnt/c)
+    is_wsl = platform.system() == "Linux" and Path("/mnt/c").exists()
+
+    if is_wsl and len(windows_path) >= 2 and windows_path[1] == ':':
+        # Convert C:/path or C:\path to /mnt/c/path
+        drive_letter = windows_path[0].lower()
+        rest_of_path = windows_path[2:].replace('\\', '/')
+        return f"/mnt/{drive_letter}{rest_of_path}"
+
+    return windows_path
+
+
 def check_api_key():
     """Check if authentication is properly configured."""
     # Check for Vertex AI
@@ -23,6 +41,10 @@ def check_api_key():
                 "GOOGLE_APPLICATION_CREDENTIALS not set for Vertex AI. "
                 "Set the path to your service account JSON file."
             )
+        # Convert path for WSL if needed
+        creds_path = _convert_path_for_wsl(creds_path)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+
         if not Path(creds_path).exists():
             raise EnvironmentError(
                 f"Google credentials file not found: {creds_path}"
