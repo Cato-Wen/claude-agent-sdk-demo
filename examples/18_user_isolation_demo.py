@@ -35,14 +35,8 @@ from claude_agent_sdk import (
     ToolUseBlock,
     ResultMessage,
 )
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from utils.config import check_api_key, PROJECT_ROOT
-
-# 权限结果类型（简化版，避免导入问题）
-def PermissionAllow(updated_input: dict) -> dict:
-    return {"behavior": "allow", "updatedInput": updated_input}
-
-def PermissionDeny(message: str, interrupt: bool = False) -> dict:
-    return {"behavior": "deny", "message": message, "interrupt": interrupt}
 
 
 # ============================================================
@@ -115,7 +109,7 @@ class IsolatedUserSession:
         tool_name: str,
         input_data: dict[str, Any],
         context: Any
-    ) -> dict:
+    ) -> PermissionResultAllow | PermissionResultDeny:
         """
         权限处理器 - 核心隔离逻辑
 
@@ -146,7 +140,7 @@ class IsolatedUserSession:
                         {"path": file_path, "resolved": str(resolved)},
                         allowed=False
                     )
-                    return PermissionDeny(
+                    return PermissionResultDeny(
                         message=f"访问被拒绝: 路径 '{file_path}' 在您的工作区外",
                         interrupt=False
                     )
@@ -165,7 +159,7 @@ class IsolatedUserSession:
                     {"path": file_path, "error": str(e)},
                     allowed=False
                 )
-                return PermissionDeny(
+                return PermissionResultDeny(
                     message=f"路径解析错误: {e}",
                     interrupt=False
                 )
@@ -196,7 +190,7 @@ class IsolatedUserSession:
                         {"command": command, "pattern": pattern},
                         allowed=False
                     )
-                    return PermissionDeny(
+                    return PermissionResultDeny(
                         message=f"危险命令被阻止: 包含 '{pattern}'",
                         interrupt=False
                     )
@@ -212,7 +206,7 @@ class IsolatedUserSession:
                         {"command": command, "target_user": other_user},
                         allowed=False
                     )
-                    return PermissionDeny(
+                    return PermissionResultDeny(
                         message=f"禁止访问其他用户的目录: {other_user}",
                         interrupt=False
                     )
@@ -243,7 +237,7 @@ class IsolatedUserSession:
                 allowed=True
             )
 
-        return PermissionAllow(updated_input=input_data)
+        return PermissionResultAllow(updated_input=input_data)
 
     async def _pre_tool_hook(
         self,
@@ -272,13 +266,13 @@ class IsolatedUserSession:
             cwd=str(self.workspace),
             allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Skill"],
             setting_sources=["project"],  # 加载 .claude/skills/ 下的 Skill 定义
-            permission_mode="delegate",  # 将所有工具权限决策委托给 can_use_tool 回调
+            # 不设置 permission_mode，让 can_use_tool 回调处理所有工具权限
             can_use_tool=self._permission_handler,
             hooks={
                 "PreToolUse": [HookMatcher(hooks=[self._pre_tool_hook])],
                 "PostToolUse": [HookMatcher(hooks=[self._post_tool_hook])],
             },
-            stderr=lambda line: print(f"  [STDERR/{self.user_id}] {line}"),
+            stderr=lambda line: print(f"  [STDERR/{self.user_id}] {line}") if any(kw in line.lower() for kw in ["permission", "can_use", "stdio", "tool_name", "warn", "error"]) else None,
             extra_args={"debug-to-stderr": None},
         )
 
@@ -291,6 +285,11 @@ class IsolatedUserSession:
         print("-" * 40)
 
         try:
+            # Debug: 打印 permission 相关配置
+            print(f"  [DEBUG] can_use_tool: {options.can_use_tool is not None}")
+            print(f"  [DEBUG] permission_mode: {options.permission_mode}")
+            print(f"  [DEBUG] permission_prompt_tool_name: {options.permission_prompt_tool_name}")
+
             async with ClaudeSDKClient(options=options) as client:
                 self.client = client
                 await client.query(prompt)
@@ -491,7 +490,7 @@ async def main():
     bob = IsolatedUserSession("bob")
 
     # 运行演示场景
-    # await demo_scenario_1_alice_creates_file(alice)
+    await demo_scenario_1_alice_creates_file(alice)
     await demo_scenario_2_bob_reads_alice_file(bob, alice)
     # await demo_scenario_3_bob_creates_own_file(bob)
     # await demo_scenario_4_alice_dangerous_command(alice)
