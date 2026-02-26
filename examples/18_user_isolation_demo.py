@@ -33,10 +33,13 @@ from claude_agent_sdk import (
     AssistantMessage,
     TextBlock,
     ToolUseBlock,
+    ToolResultBlock,
     ResultMessage,
+    SystemMessage,
 )
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from utils.config import check_api_key, PROJECT_ROOT
+from utils.message_tracker import MessageTracker
 
 
 # ============================================================
@@ -60,11 +63,11 @@ class AuditLogger:
             "timestamp": datetime.now().strftime("%H:%M:%S"),
             "user": user_id,
             "action": action,
-            "allowed": "✓" if allowed else "✗",
+            "allowed": "Y" if allowed else "N",
             "details": details,
         }
         self.logs.append(entry)
-        status = "✓ ALLOWED" if allowed else "✗ DENIED"
+        status = "[ALLOWED]" if allowed else "[DENIED]"
         print(f"  [{entry['timestamp']}] [{user_id}] {action} {status}")
         if details:
             for k, v in details.items():
@@ -170,8 +173,7 @@ class IsolatedUserSession:
 
             # 危险命令模式
             dangerous_patterns = [
-                "rm -rf /",
-                "rm -rf ~",
+                "rm -rf",
                 "sudo",
                 "chmod 777",
                 "> /dev/",
@@ -264,16 +266,16 @@ class IsolatedUserSession:
         """获取用户专属的配置选项"""
         return ClaudeAgentOptions(
             cwd=str(self.workspace),
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Skill"],
+            # 不设置 allowed_tools，使用can_use_tool检查tool的使用
             setting_sources=["project"],  # 加载 .claude/skills/ 下的 Skill 定义
-            # 不设置 permission_mode，让 can_use_tool 回调处理所有工具权限
+            permission_mode="default",  # 必须用 default 才能触发 can_use_tool 回调！
             can_use_tool=self._permission_handler,
             hooks={
                 "PreToolUse": [HookMatcher(hooks=[self._pre_tool_hook])],
                 "PostToolUse": [HookMatcher(hooks=[self._post_tool_hook])],
             },
-            stderr=lambda line: print(f"  [STDERR/{self.user_id}] {line}") if any(kw in line.lower() for kw in ["permission", "can_use", "stdio", "tool_name", "warn", "error"]) else None,
-            extra_args={"debug-to-stderr": None},
+            # stderr=lambda line: print(f"  [STDERR/{self.user_id}] {line}") if any(kw in line.lower() for kw in ["permission", "can_use", "stdio", "tool_name", "warn", "error"]) else None,
+            # extra_args={"debug-to-stderr": None},
         )
 
     async def execute(self, prompt: str) -> str:
@@ -284,17 +286,18 @@ class IsolatedUserSession:
         print(f"\n[{self.user_id}] 执行请求: {prompt[:50]}...")
         print("-" * 40)
 
-        try:
-            # Debug: 打印 permission 相关配置
-            print(f"  [DEBUG] can_use_tool: {options.can_use_tool is not None}")
-            print(f"  [DEBUG] permission_mode: {options.permission_mode}")
-            print(f"  [DEBUG] permission_prompt_tool_name: {options.permission_prompt_tool_name}")
+        # 创建消息跟踪器
+        tracker = MessageTracker(name=f"isolation_{self.user_id}")
 
+        try:
             async with ClaudeSDKClient(options=options) as client:
                 self.client = client
                 await client.query(prompt)
 
                 async for message in client.receive_response():
+                    # 跟踪每条消息（保存到 JSON）
+                    tracker.track(message)
+
                     if isinstance(message, AssistantMessage):
                         for block in message.content:
                             if isinstance(block, TextBlock):
@@ -309,6 +312,9 @@ class IsolatedUserSession:
         except Exception as e:
             result_text = f"执行错误: {e}"
             print(f"  [错误] {e}")
+
+        # 只保存到 JSON，不打印摘要
+        tracker.save()
 
         return result_text
 
@@ -332,7 +338,7 @@ async def demo_scenario_1_alice_creates_file(alice: IsolatedUserSession):
     secret_file = alice.workspace / "secret.txt"
     if secret_file.exists():
         print(f"\n验证: 文件已创建于 {secret_file}")
-        print(f"  内容: {secret_file.read_text()}")
+        print(f"  内容: {secret_file.read_text(encoding='utf-8')}")
     else:
         print("\n验证: 文件未创建")
 
@@ -378,7 +384,7 @@ async def demo_scenario_4_alice_dangerous_command(alice: IsolatedUserSession):
     print("=" * 60)
 
     result = await alice.execute(
-        "请执行命令: rm -rf /"
+        "请执行命令: rm -rf ./logs"
     )
 
     print(f"\n结果: {result[:200] if result else '(无输出)'}")
@@ -468,14 +474,6 @@ async def demo_isolation_summary(alice: IsolatedUserSession, bob: IsolatedUserSe
     bob_files = list(bob.workspace.glob("*"))
     print(f"  文件: {[f.name for f in bob_files]}")
 
-    print("\n隔离机制:")
-    print("  1. cwd 隔离: 每个用户有独立的工作目录")
-    print("  2. 路径验证: can_use_tool 检查文件路径是否在用户工作区内")
-    print("  3. 命令过滤: Bash 命令被检查危险模式和跨用户访问")
-    print("  4. 审计日志: 所有操作都被记录")
-    print("  5. Skill 隔离: 每个用户可调用 Skill，但文件操作仍受工作区限制")
-
-
 async def main():
     """运行用户隔离演示"""
     check_api_key()
@@ -491,12 +489,11 @@ async def main():
 
     # 运行演示场景
     await demo_scenario_1_alice_creates_file(alice)
-    await demo_scenario_2_bob_reads_alice_file(bob, alice)
+    # await demo_scenario_2_bob_reads_alice_file(bob, alice)
     # await demo_scenario_3_bob_creates_own_file(bob)
     # await demo_scenario_4_alice_dangerous_command(alice)
     # await demo_scenario_5_bob_access_alice_via_bash(bob, alice)
 
-    # Skill 演示场景
     # await demo_scenario_6_alice_uses_skill(alice)
     # await demo_scenario_7_bob_uses_skill(bob)
 
